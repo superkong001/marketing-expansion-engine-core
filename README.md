@@ -1,209 +1,135 @@
-# CSV特征统计解析与差异度计算模块
+# Marketing Expansion Engine (Core)
 
-## 概述
+基于**统计特征（非明细数据）**进行客群差异挖掘与可解释规则组合，输出字段阈值与枚举条件，
+供统计人员在后台拉取用户清单，用于营销扩展触达。
 
-本模块用于解析上游系统（GBase SQL）生成的统计CSV文件，并计算全量客群vs圈定客群的特征差异度。
+------------------------------------------------------------------------
 
-## 模块说明
+## 一、项目定位
 
-### 1. stats_config.py - 配置模块
-- **功能**: 管理全量和圈定客群的CSV文件路径
-- **主要类**:
-  - `CohortFileConfig`: 单个客群的文件配置
-  - `OverallConfig`: 整体配置（包含全量和圈定）
-- **主要函数**:
-  - `load_config_from_args()`: 根据目录和命名约定构建配置
+本项目适用于：
 
-### 2. stats_loader.py - CSV解析模块
-- **功能**: 解析连续型和离散型统计CSV文件
-- **主要函数**:
-  - `load_numeric_stats()`: 加载连续型特征统计CSV
-  - `load_categorical_stats()`: 加载离散型特征统计CSV
-- **特性**:
-  - 统一列名格式（snake_case）
-  - 计算衍生字段（如std = sqrt(var_val)）
-  - 设置合适的索引
-  - 保留ext_info列用于标识客群
+-   只有"全量客群 vs 圈定客群"的字段统计结果
+-   无法获取用户级明细数据
+-   目标是输出"可执行规则"而非训练黑盒模型
 
-### 3. diff_numeric.py - 连续特征差异度计算
-- **功能**: 计算全量vs圈定的连续特征差异
-- **主要函数**:
-  - `compute_numeric_diffs()`: 计算连续特征差异指标
-- **计算指标**:
-  - mean_diff: 均值差异
-  - mean_diff_ratio: 均值差异比例
-  - effect_size: 效应量（Cohen's d）
-  - delta_median: 中位数差异
-  - delta_p95: P95分位数差异
-  - delta_IQR: 四分位距差异
-  - diff_score: 综合差异分数
+输出结果为：
 
-### 4. diff_categorical.py - 离散特征差异度计算
-- **功能**: 计算全量vs圈定的离散特征差异
-- **主要函数**:
-  - `compute_categorical_diffs()`: 计算离散特征差异指标
-- **计算指标**:
-  - sum_abs_diff: 绝对频率差异之和
-  - max_abs_diff: 最大绝对频率差异
-  - top_diff_categories: 前3个差异最大的类别
-  - entropy_diff: 熵差异
-  - diff_score: 综合差异分数
+-   连续字段阈值区间
+-   离散字段枚举集合
+-   3 条规则组合（k=3）的可解释营销扩展方案
 
-### 5. diff_main.py - CLI入口
-- **功能**: 提供命令行接口，串联整个流程
-- **主要功能**:
-  - 解析命令行参数
-  - 加载CSV文件
-  - 计算差异
-  - 输出结果到CSV文件
+------------------------------------------------------------------------
 
-## 使用方法
+## 二、系统架构
 
-### 命令行使用
+### Stage1：差异特征挖掘
 
-```bash
-# 基本用法
-python diff_main.py \
-    --full-dir ./full_stats \
-    --cohort-dir ./cohort_stats \
-    --stat-date 202510 \
-    --cohort-name PRODUCT_A
+功能：
 
-# 指定输出目录
-python diff_main.py \
-    --full-dir ./full_stats \
-    --cohort-dir ./cohort_stats \
-    --stat-date 202510 \
-    --cohort-name PRODUCT_A \
-    --output-dir ./output
+-   连续特征差异计算（均值、分位数、IQR、CV 等）
+-   单侧尾部阈值推荐（避免常态区间）
+-   离散特征差异与推荐类别集合
+-   输出字段级差异结果
+
+输出：
+
+-   numeric_diff\_{cohort}\_{date}.csv
+-   categorical_diff\_{cohort}\_{date}.csv
+
+------------------------------------------------------------------------
+
+### Stage2：营销扩展规则引擎
+
+功能：
+
+1.  生成原子规则（单字段阈值 / 枚举条件）
+2.  估计规则覆盖率 / 提升度 / 精度
+3.  Beam Search 生成 k=3 规则组合
+4.  基于覆盖与精度约束筛选组合
+5.  输出多组推荐营销扩展方案
+
+输出：
+
+-   atomic_rules\_{cohort}\_{date}.csv/json
+-   candidate_segments\_{cohort}\_{date}.csv/json
+-   segment_portfolio\_{cohort}\_{date}.json
+
+------------------------------------------------------------------------
+
+## 三、使用方法
+
+### 1. Stage1
+
+``` bash
+python run_stage1.py   --stat-date 202510   --full-dir ./data/full_stats   --cohort-dir ./data/cohort_stats   --output-dir ./data/stage1_output
 ```
 
-### 参数说明
+### 2. Stage2
 
-- `--full-dir`: 全量客群CSV文件所在目录（默认: ./full_stats）
-- `--cohort-dir`: 圈定客群CSV文件所在目录（默认: ./cohort_stats）
-- `--stat-date`: 统计日期，格式为YYYYMM，如202510（必填）
-- `--cohort-name`: 圈定客群名称/ID，如PRODUCT_A（必填）
-- `--output-dir`: 输出目录（默认: ./output）
-
-### 文件命名约定
-
-系统按照以下约定查找CSV文件：
-
-- 全量连续型: `{full_dir}/numeric_stats_full_{stat_date}.csv`
-- 全量离散型: `{full_dir}/categorical_stats_full_{stat_date}.csv`
-- 圈定连续型: `{cohort_dir}/numeric_stats_{cohort_name}_{stat_date}.csv`
-- 圈定离散型: `{cohort_dir}/categorical_stats_{cohort_name}_{stat_date}.csv`
-
-### 输出文件
-
-结果会保存到输出目录：
-
-- `output/numeric_diff_{cohort_name}_{stat_date}.csv` - 连续特征差异结果
-- `output/categorical_diff_{cohort_name}_{stat_date}.csv` - 离散特征差异结果
-
-## CSV文件格式要求
-
-### 连续型特征统计CSV必需列
-
-- stat_date: 统计日期
-- column_id: 字段ID
-- column_name: 字段名称
-- total_count: 总记录数
-- nonnull_count: 非空记录数
-- nonnull_ratio: 非空比例
-- mean: 均值
-- var_val: 方差
-- q1_cont: 第一四分位数
-- q2_cont: 中位数
-- q3_cont: 第三四分位数
-- p05_cont: 5%分位数
-- p90_cont: 90%分位数
-- p95_cont: 95%分位数
-- p99_cont: 99%分位数
-- IQR: 四分位距
-- CV: 变异系数
-- source_type: 数据源类型（1=全量，2=圈定）
-- ext_info: 客群补充信息
-
-### 离散型特征统计CSV必需列
-
-- stat_date: 统计日期
-- column_id: 字段ID
-- column_name: 字段名称
-- total_count: 总记录数
-- val_enum: 枚举值
-- val_count: 该枚举值的数量
-- val_ratio: 该枚举值的比例
-- val_rank: 该枚举值的排名
-- unique_count: 唯一值数量
-- entropy: 熵
-- gini: 基尼系数
-- source_type: 数据源类型（1=全量，2=圈定）
-- ext_info: 客群补充信息
-
-## 编程接口使用
-
-### 示例代码
-
-```python
-from pathlib import Path
-from stats_config import load_config_from_args
-from stats_loader import load_numeric_stats, load_categorical_stats
-from diff_numeric import compute_numeric_diffs
-from diff_categorical import compute_categorical_diffs
-
-# 1. 构建配置
-config = load_config_from_args(
-    full_base_dir="./full_stats",
-    cohort_base_dir="./cohort_stats",
-    stat_date="202510",
-    cohort_name="PRODUCT_A"
-)
-
-# 2. 加载CSV文件
-full_numeric_df = load_numeric_stats(config.full.numeric_csv_path)
-full_categorical_df = load_categorical_stats(config.full.categorical_csv_path)
-cohort_numeric_df = load_numeric_stats(config.cohort.numeric_csv_path)
-cohort_categorical_df = load_categorical_stats(config.cohort.categorical_csv_path)
-
-# 3. 计算差异
-numeric_diff_df = compute_numeric_diffs(full_numeric_df, cohort_numeric_df)
-categorical_diff_df = compute_categorical_diffs(full_categorical_df, cohort_categorical_df)
-
-# 4. 查看结果
-print(numeric_diff_df.head(20))
-print(categorical_diff_df.head(20))
+``` bash
+python run_stage2.py   --stat-date 202510   --cohort-name sub   --stage1-output-dir ./data/stage1_output   --output-dir ./data/stage2_output
 ```
 
-## 依赖要求
+------------------------------------------------------------------------
 
-- Python 3.9+
-- pandas
-- numpy
-- scipy（可选）
+## 四、关键配置说明（config.json）
 
-## 注意事项
+### 1）覆盖率控制（控制名单规模）
 
-1. **文件路径**: 确保CSV文件路径正确，系统会检查文件是否存在
-2. **列名**: CSV文件必须包含所有必需列，否则会抛出ValueError
-3. **索引**: 解析后的DataFrame使用多级索引，注意索引结构
-4. **数据类型**: 系统会自动处理数据类型转换，但建议CSV中数值列为数字格式
-5. **日志**: 使用logging模块记录关键步骤，可通过日志了解执行过程
+-   max_base_cov：单条规则最大覆盖率
+-   max_combo_cov_est：组合规则最大覆盖率
+-   min_sub_cov：单条规则最小圈定覆盖
 
-## 错误处理
+### 2）精度控制（控制误触率）
 
-- **文件不存在**: 抛出FileNotFoundError，包含文件路径信息
-- **必需列缺失**: 抛出ValueError，列出缺失的列名
-- **数据类型错误**: 抛出TypeError或ValueError，包含详细信息
-- **计算错误**: 记录warning日志，跳过有问题的字段，继续处理其他字段
+-   expected_cohort_ratio：圈定占比（必须正确填写）
+-   min_combo_precision：组合最小估计精度
 
-## 扩展说明
+### 3）结构控制（可解释性）
 
-本模块设计为可扩展的架构：
+-   max_features_per_segment：组合规则条数（建议 3）
+-   require_exact_k：是否只输出严格 k 条规则
 
-1. **计算逻辑与IO分离**: 可以轻松替换CSV读取为数据库查询
-2. **模块化设计**: 各模块独立，可以单独使用或替换
-3. **类型注解**: 所有函数都有完整的类型注解，便于IDE支持和类型检查
-4. **日志系统**: 使用标准logging模块，便于集成到更大的系统中
+------------------------------------------------------------------------
 
+## 五、设计原则
+
+1.  只使用统计数据，不依赖明细样本
+2.  优先使用"尾部阈值"，避免常态区间
+3.  强调小覆盖 + 高浓度组合
+4.  输出多组方案供营销选择
+5.  所有规则必须可解释、可执行
+
+------------------------------------------------------------------------
+
+## 六、重要说明
+
+本项目不是分类模型，不以 ROC/AUC 为目标。
+
+优化方向是：
+
+-   更小的组合覆盖率
+-   更高的估计精度
+-   更低的误触率
+-   更强的业务可解释性
+
+最终营销效果需在线上或抽样回流验证。
+
+------------------------------------------------------------------------
+
+## 七、适用场景
+
+-   携号转网用户扩展
+-   新产品订购用户扩展
+-   宽带订购用户扩展
+-   风险类客群识别扩展
+-   其他基于统计对比的营销扩展场景
+
+------------------------------------------------------------------------
+
+## 八、项目目标
+
+构建一个：
+
+> 可解释、可执行、可控规模、可控浓度的统计驱动营销扩展引擎
