@@ -1,0 +1,88 @@
+{
+  "_comment": "AICohortInsight 统一配置文件。修改本文件即可调整 Stage1/Stage2 参数与开关，无需改代码。",
+  "stage1": {
+    "_comment": "阶段1：特征差异计算与阈值推荐",
+    "top_k_numeric": 50,
+    "top_k_categorical": 30,
+    "target_ratio": null,
+    "distribution": {
+      "_comment": "分布类型检测（analyze_distributions）：skew_eps 偏度阈值，tail_thr 尾部比阈值",
+      "skew_eps": 0.2,
+      "tail_thr": 0.5,
+      "eps": 1e-9
+    },
+    "numeric_threshold": {
+      "_comment": "连续特征阈值推荐（仅作 debug，不参与决策）",
+      "min_cohort_coverage": 0.1,
+      "min_lift": 1.2,
+      "max_base_cov_for_numeric": 0.15
+    },
+    "categorical_threshold": {
+      "_comment": "离散特征类别推荐：min_delta 最小差异，min_cov 最小覆盖率，min_increment 边际增量",
+      "min_delta": 0.01,
+      "min_cov": 0.1,
+      "min_increment": 0.01
+    },
+    "diff_numeric": {
+      "_comment": "连续差异计算：effect_size 超过此阈值视为显著",
+      "effect_size_significant_threshold": 0.2,
+      "w_effect_size": 0.5,
+      "w_delta_median": 0.3,
+      "w_delta_p95": 0.2
+    },
+    "diff_categorical": {
+      "_comment": "离散差异计算：返回前 top_k 个差异最大类别",
+      "top_k": 3
+    }
+  },
+  "stage2": {
+    "_comment": "阶段2：原子规则、Beam Search、客群评分与组合",
+    "max_features_per_segment": 3,
+    "top_k_features": 30,
+    "beam_size": 20,
+    "top_n_candidates": 30,
+    "max_segments": 5,
+    "overlap_max": 0.6,
+    "different_field_overlap": 0.3,
+    "min_stability_score": 0.3,
+    "min_divergence_score": 0.1,
+    "min_rules_per_segment": 3,
+    "similarity_threshold": 0.4,
+    "w_effect_size": 0.4,
+    "w_delta_mean": 0.3,
+    "w_quantile_shift": 0.2,
+    "w_significance": 0.1,
+    "stability_w_std": 0.4,
+    "stability_w_kurtosis": 0.3,
+    "stability_w_sample": 0.3,
+    "beam_w_divergence": 0.5,
+    "beam_w_stability": 0.3,
+    "beam_w_diversity": 0.2,
+    "lift_min": 1.5,
+    "min_delta": 0.02,
+    "max_categories": 5,
+    "expected_cohort_ratio": 0.01,
+    "enable_precision_filter": true,
+    "min_atomic_rules_for_search": 30,
+    "max_base_cov": 0.15,
+    "allow_main_for_beam": true,
+    "main_max_base_cov": 0.30,
+    "categorical_max_base_cov": 0.40,
+    "fallback_max_base_cov": 0.5,
+    "min_sub_cov": 0.02,
+    "min_lift_atomic": 2.2,
+    "fallback_min_lift_atomic": 1.2,
+    "min_precision_mult": 3,
+    "max_combo_cov_est": 0.1,
+    "require_rare_anchor": true,
+    "rare_anchor_base_cov": 0.2,
+    "min_combo_precision": 0.2,
+    "require_exact_k": true,
+    "allow_missing_pi": false,
+    "pair_assoc_path": null,
+    "pair_redundant_thr": 0.7,
+    "pair_conflict_thr": 0.8,
+    "pair_conflict_sign": -1,
+    "pair_redundant_types": ["cont_cont_linear", "cont_cont_rank"]
+  }
+}
