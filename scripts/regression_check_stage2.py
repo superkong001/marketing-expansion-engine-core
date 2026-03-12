@@ -91,7 +91,7 @@ def test_atomic_filter_removes_wide_rule():
 
 
 def test_require_exact_k_and_combo_metrics():
-    """require_exact_k 时仅保留 k=3；SegmentRule 含 combo_* 与 fp_rate_est"""
+    """require_exact_k 时仅保留 k=3；SegmentRule 含 Fréchet 区间 combo_*_lb/ub"""
     from stage2.stage2_config import Stage2Config
     from stage2.rule_combination import SegmentRule
 
@@ -106,24 +106,141 @@ def test_require_exact_k_and_combo_metrics():
             {'column_id': 'C', 'type': 'numeric', 'base_cov': 0.1, 'sub_cov': 0.2},
         ],
         score=0.7,
-        combo_base_cov_est=0.001,
-        combo_sub_cov_est=0.008,
-        combo_lift_est=8.0,
-        combo_precision_est=0.07,
-        fp_rate_est=0.00099,
+        combo_base_cov_lb=0.0,
+        combo_base_cov_ub=0.001,
+        combo_sub_cov_lb=0.0,
+        combo_sub_cov_ub=0.008,
+        combo_precision_lb=0.05,
+        combo_precision_ub=0.10,
     )
-    assert getattr(r, 'combo_precision_est', None) is not None
-    assert getattr(r, 'fp_rate_est', None) is not None
+    assert getattr(r, 'combo_precision_lb', None) is not None
+    assert getattr(r, 'combo_precision_ub', None) is not None
+    assert getattr(r, 'combo_base_cov_ub', None) is not None
     assert len(r.feature_rules) == 3
-    print("  require_exact_k + combo 指标: OK")
+    print("  require_exact_k + combo 区间指标: OK")
+
+
+def test_pair_assoc_with_table_hard_thr_no_strong_pair():
+    """有表 + hard_thr=0.85：mock 表含 (A,B)=0.9，断言最终任意 segment 中不包含字段对 (A,B)（同一客群内无 strength>=0.85 的对）"""
+    import pandas as pd
+    from stage2.stage2_config import Stage2Config
+    from stage2.rule_combination import combine_rules_beam_search
+    from stage2.pair_assoc import PairAssocIndex
+
+    config = Stage2Config()
+    config.pair_assoc_hard_thr = 0.85
+    config.enable_pair_assoc_pruning = True
+    config.max_features_per_segment = 3
+    config.beam_size = 20
+    config.top_k_features = 10
+    config.require_exact_k = False
+    # 最小原子规则：A, B, C 三条 numeric
+    atomic = pd.DataFrame([
+        {'column_id': 'A', 'rule_type_feature': 'numeric', 'divergence_score': 0.6, 'stability_score': 0.5, 'direction': 'high', 'rule_low': 0, 'rule_high': 1, 'base_cov': 0.1, 'sub_cov': 0.2, 'column_name': 'A'},
+        {'column_id': 'B', 'rule_type_feature': 'numeric', 'divergence_score': 0.6, 'stability_score': 0.5, 'direction': 'high', 'rule_low': 0, 'rule_high': 1, 'base_cov': 0.1, 'sub_cov': 0.2, 'column_name': 'B'},
+        {'column_id': 'C', 'rule_type_feature': 'numeric', 'divergence_score': 0.6, 'stability_score': 0.5, 'direction': 'high', 'rule_low': 0, 'rule_high': 1, 'base_cov': 0.1, 'sub_cov': 0.2, 'column_name': 'C'},
+    ])
+    numeric_diff = pd.DataFrame(index=['A', 'B', 'C'], data={'column_name': ['A', 'B', 'C']})
+    categorical_diff = pd.DataFrame()
+    pair_df = pd.DataFrame([
+        {'column_id_a': 'A', 'column_id_b': 'B', 'corr_strength': 0.9, 'corr_type': 'cont_cont_linear', 'corr_sign': 1},
+    ])
+    index = PairAssocIndex(pair_df, stat_date=None, min_support=0)
+    candidates, beam_stats = combine_rules_beam_search(
+        atomic, numeric_diff, categorical_diff, config,
+        pair_assoc_df=pair_df, pair_assoc_index=index
+    )
+    for c in candidates:
+        cols = [fr['column_id'] for fr in c.feature_rules]
+        if 'A' in cols and 'B' in cols:
+            assert index.get_strength('A', 'B') < 0.85, "segment 中不应同时含 (A,B) 且 strength>=0.85"
+    # 应有高相关剪枝发生（A,B 不应同时出现）
+    segments_with_a_and_b = [c for c in candidates if 'A' in [fr['column_id'] for fr in c.feature_rules] and 'B' in [fr['column_id'] for fr in c.feature_rules]]
+    assert len(segments_with_a_and_b) == 0, "不应存在同时包含 A 与 B 的 segment（strength=0.9 >= 0.85 应被剪枝）"
+    print("  pair_assoc 有表 + hard_thr 无强相关对: OK")
+
+
+def test_pair_assoc_without_table_no_error():
+    """无表：不传 pair_assoc 表，断言流程正常、返回 (list, beam_stats) 且 beam_stats 含三项"""
+    import pandas as pd
+    from stage2.stage2_config import Stage2Config
+    from stage2.rule_combination import combine_rules_beam_search
+
+    config = Stage2Config()
+    config.max_features_per_segment = 2
+    config.beam_size = 5
+    config.top_k_features = 5
+    atomic = pd.DataFrame([
+        {'column_id': 'A', 'rule_type_feature': 'numeric', 'divergence_score': 0.5, 'stability_score': 0.5, 'direction': 'high', 'rule_low': 0, 'rule_high': 1, 'base_cov': 0.1, 'sub_cov': 0.2, 'column_name': 'A'},
+        {'column_id': 'B', 'rule_type_feature': 'numeric', 'divergence_score': 0.5, 'stability_score': 0.5, 'direction': 'high', 'rule_low': 0, 'rule_high': 1, 'base_cov': 0.1, 'sub_cov': 0.2, 'column_name': 'B'},
+    ])
+    numeric_diff = pd.DataFrame(index=['A', 'B'], data={'column_name': ['A', 'B']})
+    categorical_diff = pd.DataFrame()
+    candidate_rules, beam_stats = combine_rules_beam_search(
+        atomic, numeric_diff, categorical_diff, config,
+        pair_assoc_df=None, pair_assoc_index=None
+    )
+    assert isinstance(candidate_rules, list)
+    assert isinstance(beam_stats, dict)
+    assert beam_stats.get('pruned_high_corr', 0) == 0
+    assert beam_stats.get('penalized_mid_corr', 0) == 0
+    assert beam_stats.get('pruned_conflict', 0) == 0
+    print("  pair_assoc 无表 行为一致: OK")
+
+
+def test_pair_assoc_soft_penalty_lower_score():
+    """软惩罚：mock 表存在 0.65~0.85 中相关对 (A,B)=0.7，断言该组合仍出现但 penalized_mid_corr>0 且 (A,B) 组合得分较无表时低"""
+    import pandas as pd
+    from stage2.stage2_config import Stage2Config
+    from stage2.rule_combination import combine_rules_beam_search
+    from stage2.pair_assoc import PairAssocIndex
+
+    config = Stage2Config()
+    config.pair_assoc_soft_thr = 0.65
+    config.pair_assoc_hard_thr = 0.85
+    config.pair_assoc_soft_penalty = 0.15
+    config.enable_pair_assoc_pruning = True
+    config.max_features_per_segment = 2
+    config.beam_size = 20
+    config.top_k_features = 10
+    atomic = pd.DataFrame([
+        {'column_id': 'A', 'rule_type_feature': 'numeric', 'divergence_score': 0.6, 'stability_score': 0.5, 'direction': 'high', 'rule_low': 0, 'rule_high': 1, 'base_cov': 0.1, 'sub_cov': 0.2, 'column_name': 'A'},
+        {'column_id': 'B', 'rule_type_feature': 'numeric', 'divergence_score': 0.6, 'stability_score': 0.5, 'direction': 'high', 'rule_low': 0, 'rule_high': 1, 'base_cov': 0.1, 'sub_cov': 0.2, 'column_name': 'B'},
+    ])
+    numeric_diff = pd.DataFrame(index=['A', 'B'], data={'column_name': ['A', 'B']})
+    categorical_diff = pd.DataFrame()
+    # 无表
+    candidates_no_table, _ = combine_rules_beam_search(
+        atomic, numeric_diff, categorical_diff, config,
+        pair_assoc_df=None, pair_assoc_index=None
+    )
+    # 有表：(A,B)=0.7 中相关
+    pair_df = pd.DataFrame([
+        {'column_id_a': 'A', 'column_id_b': 'B', 'corr_strength': 0.7, 'corr_type': 'cont_cont_linear', 'corr_sign': 1},
+    ])
+    index = PairAssocIndex(pair_df, stat_date=None, min_support=0)
+    candidates_with_table, beam_stats = combine_rules_beam_search(
+        atomic, numeric_diff, categorical_diff, config,
+        pair_assoc_df=pair_df, pair_assoc_index=index
+    )
+    ab_no = [c for c in candidates_no_table if len(c.feature_rules) == 2 and {fr['column_id'] for fr in c.feature_rules} == {'A', 'B'}]
+    ab_yes = [c for c in candidates_with_table if len(c.feature_rules) == 2 and {fr['column_id'] for fr in c.feature_rules} == {'A', 'B'}]
+    assert len(ab_yes) >= 1, "中相关对 (A,B) 仍应出现在候选列表中"
+    assert beam_stats.get('penalized_mid_corr', 0) >= 1, "应有至少一次中相关软惩罚"
+    if ab_no and ab_yes:
+        assert ab_yes[0].score < ab_no[0].score + 1e-6, "带软惩罚的 (A,B) 得分应低于无表时"
+    print("  pair_assoc 软惩罚 中相关得分降低: OK")
 
 
 def main():
-    print("Stage2 回归检查（k>=3 + 原子精度过滤 + require_exact_k + 导出列）")
+    print("Stage2 回归检查（k>=3 + 原子精度过滤 + require_exact_k + 导出列 + pair_assoc）")
     test_candidate_export_min_k3()
     test_portfolio_min_k3()
     test_atomic_filter_removes_wide_rule()
     test_require_exact_k_and_combo_metrics()
+    test_pair_assoc_with_table_hard_thr_no_strong_pair()
+    test_pair_assoc_without_table_no_error()
+    test_pair_assoc_soft_penalty_lower_score()
     print("全部通过.")
 
 
