@@ -35,10 +35,10 @@ def check_numeric_conflict(rule1: Any, rule2: Any) -> Tuple[bool, str]:
         fr1 = rule1_map[col_id]
         fr2 = rule2_map[col_id]
         
-        low1 = fr1.get('low', float('-inf'))
-        high1 = fr1.get('high', float('inf'))
-        low2 = fr2.get('low', float('-inf'))
-        high2 = fr2.get('high', float('inf'))
+        low1 = fr1.get('low') if fr1.get('low') is not None else float('-inf')
+        high1 = fr1.get('high') if fr1.get('high') is not None else float('inf')
+        low2 = fr2.get('low') if fr2.get('low') is not None else float('-inf')
+        high2 = fr2.get('high') if fr2.get('high') is not None else float('inf')
         
         # 检查区间是否完全分离（无重叠）
         if high1 <= low2 or high2 <= low1:

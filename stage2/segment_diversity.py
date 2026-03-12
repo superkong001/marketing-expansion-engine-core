@@ -11,6 +11,24 @@ from typing import List, Dict, Optional, Any
 logger = logging.getLogger(__name__)
 
 
+def jaccard_distance_feature_ids(ids_a: List[str], ids_b: List[str]) -> float:
+    """
+    基于 column_id 列表计算 Jaccard 距离：1 - |A∩B|/|A∪B|。
+    空集约定：两空 0；一空一非空 1。
+    """
+    set_a = set(ids_a) if ids_a else set()
+    set_b = set(ids_b) if ids_b else set()
+    if not set_a and not set_b:
+        return 0.0
+    if not set_a or not set_b:
+        return 1.0
+    inter = len(set_a & set_b)
+    union = len(set_a | set_b)
+    if union == 0:
+        return 0.0
+    return 1.0 - (inter / union)
+
+
 def calculate_feature_diversity(rule1: Any, rule2: Any) -> float:
     """
     计算两个规则的特征多样性
@@ -132,47 +150,38 @@ def calculate_interval_overlap(rule1: Any, rule2: Any) -> float:
         return 0.0
 
 
-def calculate_rule_structure_distance(rule1: Any, rule2: Any) -> float:
+def get_rule_overlap_stats(rule1: Any, rule2: Any) -> tuple:
     """
-    计算规则结构距离（用于多客群去重）
-    
-    基于字段集合差异和区间重叠度，计算规则之间的结构距离
-    距离越大，规则差异越大
-    
-    公式：distance = 1 - similarity
-    similarity = w_field · field_similarity + w_interval · interval_overlap
-    
-    Args:
-        rule1: 规则1
-        rule2: 规则2
-    
+    给定两条规则，返回共享字段数与 Jaccard 距离（用于高重叠判定）。
     Returns:
-        结构距离（0-1之间），0表示完全相同，1表示完全不同
+        (shared_field_count, jaccard_distance): 共享字段数、Jaccard 距离 (0~1，1 表示完全不同)
     """
-    # 获取字段集合
     columns1 = {fr['column_id'] for fr in rule1.feature_rules}
     columns2 = {fr['column_id'] for fr in rule2.feature_rules}
-    
-    # 字段集合相似度（Jaccard相似度）
-    if not columns1 and not columns2:
-        field_similarity = 1.0
-    elif not columns1 or not columns2:
-        field_similarity = 0.0
-    else:
-        intersection = len(columns1 & columns2)
-        union = len(columns1 | columns2)
-        field_similarity = intersection / union if union > 0 else 0.0
-    
-    # 区间重叠度
-    interval_overlap = calculate_interval_overlap(rule1, rule2)
-    
-    # 综合相似度（字段集合权重0.4，区间重叠权重0.6）
-    similarity = 0.4 * field_similarity + 0.6 * interval_overlap
-    
-    # 结构距离 = 1 - 相似度
-    distance = 1.0 - similarity
-    
-    return max(0.0, min(1.0, distance))
+    intersection = len(columns1 & columns2)
+    union = len(columns1 | columns2)
+    if union == 0:
+        return intersection, 0.0
+    jaccard_similarity = (intersection / union) if union > 0 else 0.0
+    jaccard_distance = 1.0 - jaccard_similarity
+    return intersection, max(0.0, min(1.0, jaccard_distance))
+
+
+def calculate_rule_structure_distance(rule1: Any, rule2: Any) -> float:
+    """
+    计算规则结构距离（用于多客群去重）。
+    优先使用 rule_feature_ids 的 Jaccard 距离：1 - |A∩B|/|A∪B|；
+    若无则从 feature_rules 抽 column_id 再算 Jaccard，保证不同字段集合时距离 > 0。
+    """
+    ids1 = getattr(rule1, 'rule_feature_ids', None)
+    ids2 = getattr(rule2, 'rule_feature_ids', None)
+    if ids1 is None and rule1.feature_rules:
+        ids1 = sorted([fr['column_id'] for fr in rule1.feature_rules])
+    if ids2 is None and rule2.feature_rules:
+        ids2 = sorted([fr['column_id'] for fr in rule2.feature_rules])
+    ids1 = ids1 or []
+    ids2 = ids2 or []
+    return max(0.0, min(1.0, jaccard_distance_feature_ids(ids1, ids2)))
 
 
 def calculate_rule_similarity(rule1: Any, rule2: Any) -> float:
@@ -273,9 +282,15 @@ def filter_similar_rules(
             ]
             avg_similarity = np.mean(similarities) if similarities else 0.0
             
-            # 如果平均相似度低于阈值，则保留该规则
+            # 如果平均相似度低于阈值，则保留该规则；否则剔除并打日志
             if avg_similarity < similarity_threshold:
                 selected_rules.append(rule)
+            else:
+                rule_id = getattr(rule, 'rule_signature', None) or getattr(rule, 'segment_id', None) or id(rule)
+                logger.debug(
+                    "filter_similar_rules 剔除: rule_id=%s, avg_similarity=%.4f >= threshold=%.2f",
+                    rule_id, avg_similarity, similarity_threshold
+                )
     
     return selected_rules
 

@@ -10,8 +10,10 @@ lift_est（连续）以及 cohort_coverage、full_coverage、lift（离散）等
 上述列不存在时不得报错（optional debug columns）。
 """
 import argparse
+import json
 import logging
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -30,11 +32,13 @@ try:
     )
     from .rule_combination import combine_rules_beam_search
     from .segment_scoring import filter_candidate_segments
-    from .segment_portfolio import build_segment_portfolio
+    from .segment_portfolio import build_segment_portfolio, dedup_same_structure_candidates
+    from .pair_assoc import PairAssocIndex
     from .rule_output import (
         export_atomic_rules,
         export_candidate_segments,
-        export_segment_portfolio
+        export_segment_portfolio,
+        segment_canonical_key,
     )
 except ImportError:
     from stage2_config import Stage2Config
@@ -48,12 +52,30 @@ except ImportError:
     )
     from rule_combination import combine_rules_beam_search
     from segment_scoring import filter_candidate_segments
-    from segment_portfolio import build_segment_portfolio
+    from segment_portfolio import build_segment_portfolio, dedup_same_structure_candidates
+    try:
+        from pair_assoc import PairAssocIndex
+    except ImportError:
+        PairAssocIndex = None
     from rule_output import (
         export_atomic_rules,
         export_candidate_segments,
-        export_segment_portfolio
+        export_segment_portfolio,
+        segment_canonical_key,
     )
+
+try:
+    from stage1.threshold_numeric import estimate_coverage_from_quantiles
+except ImportError:
+    try:
+        import sys
+        from pathlib import Path
+        _root = Path(__file__).resolve().parent.parent
+        if str(_root) not in sys.path:
+            sys.path.insert(0, str(_root))
+        from stage1.threshold_numeric import estimate_coverage_from_quantiles
+    except ImportError:
+        estimate_coverage_from_quantiles = None  # optional for per-rule coverage
 
 # Stage1 输出若为业务可读表头时，反向映射为技术列名以便后续计算。
 # 其中 cohort_coverage_est / full_coverage_est / lift_est 等为 optional debug 列，存在则映射，不存在不报错。
@@ -143,11 +165,23 @@ def main():
         default=None,
         help='字段对关联统计表路径（可选）；不指定时自动在 full-stats-dir 下查找 ST_ANA_FEAT_PAIR_ASSOC_ALL_{stat_date}.xlsx'
     )
-    
+    # 输出目标约束（平衡准确率与覆盖率）
+    parser.add_argument('--target-precision-min', type=float, default=None,
+                        help='期望准确率下限（默认 0.8，即高准确率 80%% 以上）；估计准确率低于此的 segment 不进入输出')
+    parser.add_argument('--target-coverage-min', type=float, default=None,
+                        help='期望覆盖率下限，即目标召回率（默认 0.7）')
+    parser.add_argument('--target-segments', type=int, default=None,
+                        help='预期输出客群数；不指定时使用 config 的 max_segments')
+    parser.add_argument('--target-user-10k', type=float, default=None,
+                        help='预期圈定用户数（万人），可选；需全量人数时参与换算')
+    parser.add_argument('--use-f1-balance', type=lambda x: x.lower() in ('1', 'true', 'yes'), default=None,
+                        help='是否用 F1 平衡准确率与覆盖率（默认 True）')
+    parser.add_argument('--target-priority', type=str, default=None, choices=['f1', 'precision_first', 'coverage_first'],
+                        help='无法同时满足时优先级（默认 f1）')
+
     args = parser.parse_args()
-    
+
     try:
-        # 执行阶段2流程
         run_stage2_analysis(
             stage1_output_dir=args.stage1_output_dir,
             stat_date=args.stat_date,
@@ -155,7 +189,13 @@ def main():
             output_dir=args.output_dir,
             config_path=args.config,
             pair_assoc_path=args.pair_assoc,
-            full_stats_dir=args.full_stats_dir
+            full_stats_dir=args.full_stats_dir,
+            target_precision_min=args.target_precision_min,
+            target_coverage_min=args.target_coverage_min,
+            target_segment_count=args.target_segments,
+            target_user_count_10k=args.target_user_10k,
+            use_f1_balance=args.use_f1_balance,
+            target_priority=args.target_priority,
         )
     except Exception as e:
         logger.error(f"执行失败: {e}", exc_info=True)
@@ -166,35 +206,82 @@ def main():
 PAIR_ASSOC_FILENAME_TEMPLATE = "ST_ANA_FEAT_PAIR_ASSOC_ALL_{stat_date}.xlsx"
 
 
+def _build_quantile_map_from_row(row, full_prefix: str = 'full'):
+    """Build {value: prob} from numeric_diff row: p10_full->0.1, p25_full->0.25, ..."""
+    q_specs = [
+        ('p10_' + full_prefix, 0.10), ('p25_' + full_prefix, 0.25), ('p50_' + full_prefix, 0.50),
+        ('p75_' + full_prefix, 0.75), ('p90_' + full_prefix, 0.90), ('p95_' + full_prefix, 0.95),
+    ]
+    q_map = {}
+    for col_name, prob in q_specs:
+        if col_name not in row.index:
+            continue
+        v = row.get(col_name)
+        if pd.notna(v) and np.isfinite(v):
+            try:
+                q_map[float(v)] = prob
+            except (TypeError, ValueError):
+                pass
+    return q_map
+
+
 def _compute_atomic_cov_lift(
     atomic_rules_df: pd.DataFrame,
     numeric_diff_df: pd.DataFrame,
     categorical_diff_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """为原子规则表补齐 base_cov、sub_cov、lift、precision_proxy（prior_pi 由调用方传入时再算）。"""
+    """为原子规则表补齐 base_cov、sub_cov、lift、cov_unknown（v2.0 每条连续规则按区间算覆盖率）。"""
     eps = 1e-9
     base_covs = []
     sub_covs = []
     lifts = []
+    cov_unknowns = []
     for _, row in atomic_rules_df.iterrows():
         base_cov = None
         sub_cov = None
+        cov_unknown = False
         col_id = row.get('column_id')
         if row.get('rule_type_feature') == 'numeric':
-            # 仅 main 从 numeric_diff 取全量/圈定覆盖率；tail 不填，避免用列级代表值误杀
-            if row.get('rule_type') == 'main' and col_id in numeric_diff_df.index:
+            rule_low = row.get('rule_low')
+            rule_high = row.get('rule_high')
+            low_ok = rule_low is not None and pd.notna(rule_low) and (isinstance(rule_low, (int, float)) and np.isfinite(rule_low) or rule_low == -np.inf)
+            high_ok = rule_high is not None and pd.notna(rule_high) and (isinstance(rule_high, (int, float)) and np.isfinite(rule_high) or rule_high == np.inf)
+            if low_ok and high_ok and col_id in numeric_diff_df.index and estimate_coverage_from_quantiles is not None:
                 r = numeric_diff_df.loc[col_id]
                 if isinstance(r, pd.DataFrame):
                     r = r.iloc[0]
-                base_cov = _safe_float(r.get('full_coverage_est'))
-                sub_cov = _safe_float(r.get('cohort_coverage_est'))
+                qm_full = _build_quantile_map_from_row(r, 'full')
+                qm_cohort = _build_quantile_map_from_row(r, 'cohort')
+                try:
+                    low = float(rule_low) if rule_low != -np.inf else -1e30
+                    high = float(rule_high) if rule_high != np.inf else 1e30
+                    if len(qm_full) >= 2:
+                        base_cov = float(estimate_coverage_from_quantiles(qm_full, low, high))
+                    if len(qm_cohort) >= 2:
+                        sub_cov = float(estimate_coverage_from_quantiles(qm_cohort, low, high))
+                    if base_cov is None and sub_cov is None:
+                        cov_unknown = True
+                except Exception:
+                    cov_unknown = True
+            if base_cov is None or sub_cov is None:
+                if row.get('rule_type') == 'main' and col_id in numeric_diff_df.index:
+                    r = numeric_diff_df.loc[col_id]
+                    if isinstance(r, pd.DataFrame):
+                        r = r.iloc[0]
+                    base_cov = base_cov or _safe_float(r.get('full_coverage_est'))
+                    sub_cov = sub_cov or _safe_float(r.get('cohort_coverage_est'))
+                if base_cov is None or sub_cov is None:
+                    cov_unknown = True
         else:
             if col_id in categorical_diff_df.index:
                 r = categorical_diff_df.loc[col_id]
                 base_cov = _safe_float(r.get('full_coverage'))
                 sub_cov = _safe_float(r.get('cohort_coverage'))
+            if base_cov is None and sub_cov is None:
+                cov_unknown = True
         base_covs.append(base_cov)
         sub_covs.append(sub_cov)
+        cov_unknowns.append(cov_unknown)
         if base_cov is not None and sub_cov is not None and base_cov >= eps:
             lifts.append(sub_cov / base_cov)
         else:
@@ -203,6 +290,7 @@ def _compute_atomic_cov_lift(
     df['base_cov'] = base_covs
     df['sub_cov'] = sub_covs
     df['_lift'] = lifts
+    df['cov_unknown'] = cov_unknowns
     return df
 
 
@@ -316,22 +404,19 @@ def _filter_atomic_rules_by_precision(
     返回 (过滤后带 base_cov 列的 DataFrame, prior_pi, 最终轮次的原因计数或空)。
     """
     if len(atomic_rules_df) == 0:
-        return atomic_rules_df, 0.05, {}
+        return atomic_rules_df, None, {}
     enable = getattr(config, 'enable_precision_filter', True)
     min_for_search = getattr(config, 'min_atomic_rules_for_search', 30)
     min_sub_cov = getattr(config, 'min_sub_cov', 0.02)
     min_precision_mult = getattr(config, 'min_precision_mult', 3.0)
     prior_pi_raw = getattr(config, 'expected_cohort_ratio', None)
-    allow_missing_pi = getattr(config, 'allow_missing_pi', False)
     if prior_pi_raw is None or (isinstance(prior_pi_raw, float) and (prior_pi_raw <= 0 or prior_pi_raw >= 1)):
-        if not allow_missing_pi:
-            raise ValueError(
-                "expected_cohort_ratio 未配置或不在 (0,1)，Stage2 必须填写真实先验（cohort_size/full_size）。"
-                " 若确需跳过 precision 约束，请在 config.json stage2 中显式设置 allow_missing_pi=true（不推荐）。"
-            )
         prior_pi = None
         use_precision_proxy = False
-        logger.warning("expected_cohort_ratio 未配置或无效，已跳过 precision 硬过滤；不输出 precision_est/fp_rate_est 有效值")
+        logger.warning(
+            "expected_cohort_ratio 未配置或无效，已跳过 precision 硬过滤；不输出 precision_est/fp_rate_est 有效值。"
+            " 建议在 config.json stage2 中配置 expected_cohort_ratio=cohort_size/full_size。"
+        )
     else:
         prior_pi = float(prior_pi_raw)
         use_precision_proxy = True
@@ -408,6 +493,192 @@ def _safe_float(x):
         return None
 
 
+def _compute_atomic_rule_scores(atomic_df: pd.DataFrame, config: Stage2Config) -> pd.DataFrame:
+    """
+    为原子规则表计算统一 rule_score。
+    公式：rule_score = w1*precision_est + w2*lift_est + w3*coverage_est + w4*divergence + w5*stability，
+    权重归一化后缺失项置 0 参与。
+    """
+    w1 = getattr(config, 'rule_score_w_precision', 0.25)
+    w2 = getattr(config, 'rule_score_w_lift', 0.25)
+    w3 = getattr(config, 'rule_score_w_coverage', 0.1)
+    w4 = getattr(config, 'rule_score_w_divergence', 0.2)
+    w5 = getattr(config, 'rule_score_w_stability', 0.2)
+    total = w1 + w2 + w3 + w4 + w5
+    if total <= 0:
+        total = 1.0
+    w1, w2, w3, w4, w5 = w1 / total, w2 / total, w3 / total, w4 / total, w5 / total
+
+    def _norm_prec(v):
+        if v is None or (isinstance(v, float) and (np.isnan(v) or v < 0)):
+            return 0.0
+        return min(1.0, float(v))
+
+    def _norm_lift(v):
+        if v is None or (isinstance(v, float) and (np.isnan(v) or v <= 0)):
+            return 0.0
+        return min(1.0, float(v) / 10.0)  # cap lift at 10
+
+    def _norm_cov(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return 0.0
+        return min(1.0, max(0.0, float(v)))
+
+    def _norm_01(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return 0.0
+        return max(0.0, min(1.0, float(v)))
+
+    scores = []
+    for _, row in atomic_df.iterrows():
+        prec = _norm_prec(row.get('precision_est'))
+        lift = _norm_lift(row.get('lift'))
+        cov = _norm_cov(row.get('base_cov'))
+        div = _norm_01(row.get('divergence_score', 0.0))
+        stab = _norm_01(row.get('stability_score', 0.0))
+        s = w1 * prec + w2 * lift + w3 * cov + w4 * div + w5 * stab
+        scores.append(s)
+    out = atomic_df.copy()
+    out['rule_score'] = scores
+    return out
+
+
+def _atomic_overlap_ratio(row_a: pd.Series, row_b: pd.Series, col_id: str) -> float:
+    """同 column 两条原子规则的重叠度：连续用 base_cov 比或区间重叠，离散用 rec_categories Jaccard。"""
+    feat = row_a.get('rule_type_feature', 'numeric')
+    if feat == 'categorical':
+        ra = row_a.get('rec_categories') or ''
+        rb = row_b.get('rec_categories') or ''
+        if isinstance(ra, str):
+            set_a = set(c.strip() for c in ra.split(',') if c.strip())
+        elif hasattr(ra, '__iter__') and not isinstance(ra, str):
+            set_a = set(ra)
+        else:
+            set_a = set()
+        if isinstance(rb, str):
+            set_b = set(c.strip() for c in rb.split(',') if c.strip())
+        elif hasattr(rb, '__iter__') and not isinstance(rb, str):
+            set_b = set(rb)
+        else:
+            set_b = set()
+        if not set_a and not set_b:
+            return 1.0
+        inter = len(set_a & set_b)
+        union = len(set_a | set_b)
+        return (inter / union) if union else 0.0
+    # numeric: base_cov ratio
+    ba = _safe_float(row_a.get('base_cov'))
+    bb = _safe_float(row_b.get('base_cov'))
+    if ba is not None and bb is not None and max(ba, bb) > 0:
+        return min(ba, bb) / max(ba, bb)
+    # fallback: interval overlap
+    low_a = row_a.get('rule_low')
+    high_a = row_a.get('rule_high')
+    low_b = row_b.get('rule_low')
+    high_b = row_b.get('rule_high')
+    try:
+        la = float(low_a) if low_a is not None and np.isfinite(float(low_a)) else -np.inf
+        ha = float(high_a) if high_a is not None and np.isfinite(float(high_a)) else np.inf
+        lb = float(low_b) if low_b is not None and np.isfinite(float(low_b)) else -np.inf
+        hb = float(high_b) if high_b is not None and np.isfinite(float(high_b)) else np.inf
+        inter_len = max(0.0, min(ha, hb) - max(la, lb))
+        union_len = max(ha, hb) - min(la, lb)
+        if union_len <= 0:
+            return 0.0
+        return inter_len / union_len
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _dedup_atomic_rules_after_precision(
+    atomic_df: pd.DataFrame, config: Stage2Config
+) -> Tuple[pd.DataFrame, dict]:
+    """
+    精度过滤后的原子规则去重：① 同 column 覆盖重叠>=阈值只保留 rule_score 最优；② 同特征多阈值只保留 topK。
+    返回 (去重后 DataFrame, 统计 dict)。
+    """
+    if len(atomic_df) == 0:
+        return atomic_df, {'n_before': 0, 'n_after_overlap': 0, 'n_after_same_feature': 0, 'overlap_removed': 0, 'same_feature_removed': 0}
+    thresh = getattr(config, 'atomic_overlap_dedup_threshold', 0.8)
+    max_per_col = getattr(config, 'max_atomic_rules_per_column_after_dedup', 1)
+
+    df = atomic_df.reset_index(drop=True)
+    n_before = len(df)
+    if 'column_id' not in df.columns:
+        return df, {'n_before': n_before, 'n_after_overlap': n_before, 'n_after_same_feature': n_before, 'overlap_removed': 0, 'same_feature_removed': 0}
+
+    # ① 按 column_id 分组，每组内用“重叠图”连通分量，每分量保留 rule_score 最大的一条
+    keep_idx = []
+    for col_id, grp in df.groupby('column_id', sort=False):
+        indices = grp.index.tolist()
+        if len(indices) <= 1:
+            keep_idx.extend(indices)
+            continue
+        # 两两重叠度 -> 并查集合并 >= thresh 的对
+        parent = {i: i for i in indices}
+
+        def find(x):
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+
+        def union(i, j):
+            pi, pj = find(i), find(j)
+            if pi != pj:
+                parent[pi] = pj
+
+        for ii, i in enumerate(indices):
+            for j in indices[ii + 1 :]:
+                if _atomic_overlap_ratio(df.loc[i], df.loc[j], col_id) >= thresh:
+                    union(i, j)
+        components = {}
+        for i in indices:
+            r = find(i)
+            components.setdefault(r, []).append(i)
+        for comp in components.values():
+            best = max(comp, key=lambda idx: df.loc[idx].get('rule_score', 0.0))
+            keep_idx.append(best)
+    df1 = df.loc[sorted(keep_idx)].copy()
+    n_after_overlap = len(df1)
+    overlap_removed = n_before - n_after_overlap
+
+    # ② 同特征多阈值：每 column_id 只保留 rule_score top max_per_col
+    keep_idx2 = []
+    for col_id, grp in df1.groupby('column_id', sort=False):
+        top = grp.nlargest(max_per_col, 'rule_score').index.tolist()
+        keep_idx2.extend(top)
+    df2 = df1.loc[sorted(keep_idx2)].copy()
+    n_after_same_feature = len(df2)
+    same_feature_removed = n_after_overlap - n_after_same_feature
+
+    return df2, {
+        'n_before': n_before,
+        'n_after_overlap': n_after_overlap,
+        'n_after_same_feature': n_after_same_feature,
+        'overlap_removed': overlap_removed,
+        'same_feature_removed': same_feature_removed,
+    }
+
+
+def dedup_candidates_by_signature(candidate_rules: list) -> list:
+    """按 rule_signature 去重，保留每组中 score 最大的一条。"""
+    if not candidate_rules:
+        return []
+    from collections import defaultdict
+    by_sig = defaultdict(list)
+    for r in candidate_rules:
+        sig = getattr(r, 'rule_signature', None)
+        if sig is None or sig == '':
+            sig = segment_canonical_key(r)
+            setattr(r, 'rule_signature', sig)
+        by_sig[sig].append(r)
+    out = []
+    for sig, group in by_sig.items():
+        best = max(group, key=lambda x: getattr(x, 'score', 0.0) or 0.0)
+        out.append(best)
+    return out
+
+
 def run_stage2_analysis(
     stage1_output_dir: str,
     stat_date: str,
@@ -415,7 +686,14 @@ def run_stage2_analysis(
     output_dir: str = './data/stage2_output',
     config_path: Optional[str] = None,
     pair_assoc_path: Optional[str] = None,
-    full_stats_dir: Optional[str] = './data/full_stats'
+    full_stats_dir: Optional[str] = './data/full_stats',
+    *,
+    target_precision_min: Optional[float] = None,
+    target_coverage_min: Optional[float] = None,
+    target_segment_count: Optional[int] = None,
+    target_user_count_10k: Optional[float] = None,
+    use_f1_balance: Optional[bool] = None,
+    target_priority: Optional[str] = None,
 ) -> None:
     """
     执行阶段2分析流程（coverage-free：仅使用差异/稳定性/多样性评分，不使用 coverage/lift）。
@@ -454,7 +732,21 @@ def run_stage2_analysis(
     else:
         config = Stage2Config()
         logger.info("  使用默认配置")
-    
+
+    # 命令行覆盖输出目标约束（平衡准确率与覆盖率）
+    if target_precision_min is not None:
+        config.target_precision_min = target_precision_min
+    if target_coverage_min is not None:
+        config.target_coverage_min = target_coverage_min
+    if target_segment_count is not None:
+        config.target_segment_count = target_segment_count
+    if target_user_count_10k is not None:
+        config.target_user_count_10k = target_user_count_10k
+    if use_f1_balance is not None:
+        config.use_f1_balance = use_f1_balance
+    if target_priority is not None:
+        config.target_priority = target_priority
+
     # 2. 读取阶段1的输出文件
     logger.info("\n[2/6] 读取阶段1输出文件...")
     stage1_dir = Path(stage1_output_dir)
@@ -498,7 +790,74 @@ def run_stage2_analysis(
 
     logger.info(f"  连续特征差异结果: {len(numeric_diff_df)} 个特征")
     logger.info(f"  离散特征差异结果: {len(categorical_diff_df)} 个特征")
-    
+
+    # 从 Stage1 元数据读取全量/圈定人数，用于 total_population 与 pi（严禁静默默认）
+    # 策略：先自动算 pi_from_meta = N_cohort/N_full；若计算结果 > 配置值则用计算结果，否则用配置值
+    pi_input = getattr(config, 'expected_cohort_ratio', None)
+    meta_file = stage1_dir / f"stage1_meta_{cohort_name}_{stat_date}.json"
+    pi_from_meta = None
+    n_full = getattr(config, 'total_population', None)
+    n_cohort = getattr(config, 'cohort_size', None)
+    if meta_file.exists():
+        try:
+            with open(meta_file, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+            n_full = meta.get('total_population_full')
+            if n_full is not None and getattr(config, 'total_population', None) is None:
+                config.total_population = int(n_full)
+                logger.info(f"  已从 Stage1 元数据读取全量用户数: {config.total_population}")
+            n_cohort = meta.get('total_population_cohort')
+            if n_cohort is not None:
+                config.cohort_size = int(n_cohort)
+            if n_full is not None and n_cohort is not None and int(n_full) > 0:
+                pi_from_meta = int(n_cohort) / int(n_full)
+                logger.info(f"  已从 Stage1 元数据计算 pi（候选）: {pi_from_meta:.6f} = {n_cohort}/{n_full}")
+        except Exception as e:
+            logger.warning(f"读取 Stage1 元数据失败: {e}")
+    else:
+        n_full = getattr(config, 'total_population', None)
+        n_cohort = getattr(config, 'cohort_size', None)
+    pi_candidate = pi_from_meta  # N_sub / N_total from meta when available
+    pi_config = None
+    if pi_input is not None and isinstance(pi_input, (int, float)) and 0 < float(pi_input) < 1:
+        pi_config = float(pi_input)
+    if pi_from_meta is not None and (pi_config is None or pi_from_meta >= pi_config):
+        pi_used = pi_from_meta
+        pi_source = "computed"
+        config.expected_cohort_ratio = pi_used
+        if pi_config is not None and pi_from_meta > pi_config:
+            logger.info(f"  pi 使用元数据计算结果（%.6f > 配置 %.6f）", pi_from_meta, pi_config)
+    elif pi_config is not None:
+        pi_used = pi_config
+        pi_source = "config"
+    else:
+        pi_used = None
+        pi_source = "missing"
+        if pi_from_meta is None and pi_config is None:
+            logger.warning(
+                "expected_cohort_ratio (pi) 未配置且无法从 Stage1 元数据计算（缺 total_population_cohort 或 total_population_full）。"
+                " precision_est/combo_precision_est 将为 None，排序时降权。"
+            )
+    logger.info("pi_input=%s, pi_candidate=%s, pi_used=%s, pi_source=%s", pi_input, pi_candidate, pi_used, pi_source)
+    logger.info(
+        "N_sub 对应 config.cohort_size / Stage1 元数据键 total_population_cohort；"
+        "N_all 对应 config.total_population / Stage1 元数据键 total_population_full"
+    )
+    pi_reference = getattr(config, 'pi_reference', None)
+    pi_tolerance = getattr(config, 'pi_tolerance', 1e-9)
+    if pi_reference is not None and pi_candidate is not None and abs(pi_candidate - pi_reference) > pi_tolerance:
+        logger.warning(
+            "pi 校验未通过: abs(pi_candidate - pi_reference)=%.2e > pi_tolerance=%.2e",
+            abs(pi_candidate - pi_reference), pi_tolerance
+        )
+    if pi_used is None:
+        logger.warning(
+            "expected_cohort_ratio (pi) 未配置或无法从元数据计算，precision 相关字段将置空或跳过过滤；菜单仍照常输出。"
+        )
+    logger.info(
+        "覆盖率口径: non_sub/sub/all；用户数口径: N_all_est=N_sub_est+N_non_sub_est，估计用户数区间=[N_all_lb, N_all_ub]"
+    )
+
     # 3. 计算差异评分和稳定性评分
     logger.info("\n[3/7] 计算差异评分和稳定性评分...")
     numeric_divergence_scores = calculate_divergence_score(numeric_diff_df, None, None, config)
@@ -530,10 +889,65 @@ def run_stage2_analysis(
         atomic_rules_df, numeric_diff_df, categorical_diff_df, config
     )
     n_after_atomic = len(atomic_rules_df)
+    min_for_search = getattr(config, 'min_atomic_rules_for_search', 30)
+    if n_after_atomic < min_for_search:
+        # Round3：放宽 Stage1 diff/stability 阈值（不放宽 demographic/height 硬剪枝），重新生成原子规则
+        old_div = getattr(config, 'min_divergence_score', 0.1)
+        old_stab = getattr(config, 'min_stability_score', 0.3)
+        config_relaxed = Stage2Config.from_dict(config.to_dict())
+        config_relaxed.min_divergence_score = max(0.05, old_div * 0.5)
+        config_relaxed.min_stability_score = max(0.15, old_stab * 0.5)
+        config_relaxed.min_stability_score_categorical = 0.15  # fallback 时放宽离散稳定性，保证原子数尽量 ≥30
+        numeric_atomic_relaxed = generate_numeric_atomic_rules(
+            numeric_diff_df, config_relaxed, None, None, numeric_divergence_scores, stability_scores
+        )
+        categorical_atomic_relaxed = generate_categorical_atomic_rules(
+            categorical_diff_df, config_relaxed, categorical_divergence_scores, stability_scores
+        )
+        atomic_rules_df_r3 = merge_atomic_rules(numeric_atomic_relaxed, categorical_atomic_relaxed)
+        atomic_rules_df_r3, _, _ = _filter_atomic_rules_by_precision(
+            atomic_rules_df_r3, numeric_diff_df, categorical_diff_df, config
+        )
+        n_r3 = len(atomic_rules_df_r3)
+        if n_r3 >= min_for_search:
+            n_old = n_after_atomic
+            atomic_rules_df = atomic_rules_df_r3
+            n_after_atomic = n_r3
+            logger.info(
+                "放宽了 min_divergence_score 从 %.3f 到 %.3f、min_stability_score 从 %.3f 到 %.3f，原子规则从 %d 增至 %d",
+                old_div, config_relaxed.min_divergence_score, old_stab, config_relaxed.min_stability_score,
+                n_old, n_after_atomic,
+            )
+        else:
+            logger.warning(
+                "Round3 放宽 diff/stability 后原子规则仍不足 %d（%d 条），保留 Round2 结果",
+                min_for_search, n_r3,
+            )
     logger.info(f"  最终用于 beam search 的原子规则数: {n_after_atomic}")
+    # 统一 rule_score + 原子覆盖重叠去重 + 同特征多阈值去重
+    atomic_rules_df = _compute_atomic_rule_scores(atomic_rules_df, config)
+    atomic_rules_df, dedup_stats = _dedup_atomic_rules_after_precision(atomic_rules_df, config)
+    n_after_atomic = len(atomic_rules_df)
+    logger.info(
+        "  原子规则 rule_score 与去重: 去重前 %d, 重叠去重后 %d, 同特征多阈值后 %d (overlap_removed=%d, same_feature_removed=%d)",
+        dedup_stats['n_before'], dedup_stats['n_after_overlap'], dedup_stats['n_after_same_feature'],
+        dedup_stats['overlap_removed'], dedup_stats['same_feature_removed'],
+    )
+    if 'column_id' in atomic_rules_df.columns:
+        n_cols = atomic_rules_df['column_id'].nunique()
+        logger.info("  原子规则去重后涉及特征数（按 column_id）: %d", n_cols)
+    if 'cov_unknown' in atomic_rules_df.columns:
+        n_cov_unknown = atomic_rules_df['cov_unknown'].sum() if hasattr(atomic_rules_df['cov_unknown'], 'sum') else sum(1 for x in atomic_rules_df['cov_unknown'] if x)
+        n_cov_known = n_after_atomic - n_cov_unknown
+        logger.info(f"  原子规则 cov_known: {n_cov_known}, cov_unknown: {n_cov_unknown}")
+    if 'column_id' in atomic_rules_df.columns:
+        atomic_rules_per_feature = atomic_rules_df['column_id'].value_counts()
+        parts = [f"{cid}={cnt}" for cid, cnt in atomic_rules_per_feature.items()]
+        logger.info("  atomic_rules_per_feature: %s", ", ".join(parts))
     
     # 4.5 可选：加载字段对关联统计表（缺失则仅用结构约束）
     pair_assoc_df = None
+    pair_assoc_index = None
     if pair_assoc_path and Path(pair_assoc_path).exists():
         try:
             p = Path(pair_assoc_path)
@@ -541,12 +955,23 @@ def run_stage2_analysis(
                 pair_assoc_df = pd.read_excel(pair_assoc_path)
             else:
                 pair_assoc_df = pd.read_csv(pair_assoc_path, encoding='utf-8-sig')
-            logger.info(f"  已加载字段对关联表: {pair_assoc_path}（启用相关性剪枝）")
+            if pair_assoc_df is not None and len(pair_assoc_df) > 0 and getattr(config, 'enable_pair_assoc_pruning', True) and PairAssocIndex is not None:
+                min_sup = getattr(config, 'pair_assoc_min_support', 200)
+                pair_assoc_index = PairAssocIndex(pair_assoc_df, stat_date=stat_date, min_support=min_sup)
+                logger.info(
+                    "  已加载字段对关联表: %s，行数 %d，去重后对数 %d，支持度过滤后对数 %d，已构建 PairAssocIndex",
+                    pair_assoc_path, pair_assoc_index.n_raw, pair_assoc_index.n_dedup, pair_assoc_index.n_after_support
+                )
+            else:
+                if pair_assoc_df is not None and len(pair_assoc_df) > 0:
+                    logger.info(f"  已加载字段对关联表: {pair_assoc_path}（未启用 PairAssocIndex 或未安装）")
+                else:
+                    logger.info(f"  已加载字段对关联表: {pair_assoc_path}（表为空，使用结构约束）")
         except Exception as e:
             logger.warning(f"加载字段对关联表失败，退化为结构约束: {e}")
     else:
         if pair_assoc_path:
-            logger.info("  未找到字段对关联表，使用结构约束")
+            logger.info("  未发现字段对关联表，将使用结构约束")
     
     # 5. 规则组合搜索（Coverage-free Beam Search）
     logger.info("\n[5/7] 规则组合搜索（Coverage-free Beam Search）...")
@@ -554,7 +979,7 @@ def run_stage2_analysis(
     # 构建业务分组字典（从元数据或字段名推断）
     business_groups = {}
     
-    candidate_rules = combine_rules_beam_search(
+    candidate_rules, beam_stats = combine_rules_beam_search(
         atomic_rules_df,
         numeric_diff_df,
         categorical_diff_df,
@@ -563,10 +988,34 @@ def run_stage2_analysis(
         stability_scores,
         business_groups=business_groups if business_groups else None,
         max_fields_per_business_group=2,
-        pair_assoc_df=pair_assoc_df
+        pair_assoc_df=pair_assoc_df,
+        pair_assoc_index=pair_assoc_index,
+        prior_pi=prior_pi,
     )
-    
-    logger.info(f"  生成候选规则数: {len(candidate_rules)}")
+    n_before_dedup = len(candidate_rules)
+    candidate_rules = dedup_candidates_by_signature(candidate_rules)
+    n_after_dedup = len(candidate_rules)
+    logger.info(
+        "candidates_before_dedup=%d, after_dedup=%d, dedup_removed=%d",
+        n_before_dedup, n_after_dedup, n_before_dedup - n_after_dedup,
+    )
+    if getattr(config, 'same_structure_at_candidate', True):
+        n_before_same = len(candidate_rules)
+        candidate_rules = dedup_same_structure_candidates(candidate_rules, config)
+        n_after_same = len(candidate_rules)
+        logger.info(
+            "[stage2] candidate_dedup before=%d after=%d removed=%d",
+            n_before_same, n_after_same, n_before_same - n_after_same,
+        )
+    feat_count: Counter = Counter()
+    for r in candidate_rules:
+        for fr in r.feature_rules:
+            cid = fr.get('column_id', '')
+            if cid:
+                feat_count[cid] += 1
+    if feat_count:
+        parts = [f"{cid}={cnt}" for cid, cnt in feat_count.most_common()]
+        logger.info("  candidate_rules_per_feature: %s", ", ".join(parts))
     if getattr(config, 'require_exact_k', False):
         k = getattr(config, 'max_features_per_segment', 3)
         n_k = sum(1 for r in candidate_rules if len(r.feature_rules) == k)
@@ -594,8 +1043,10 @@ def run_stage2_analysis(
     # 构建差异评分字典
     divergence_scores_dict = all_divergence_scores.to_dict()
     portfolio = build_segment_portfolio(candidate_rules_for_export, config, divergence_scores_dict)
+    if getattr(portfolio, 'portfolio_metrics', None) is not None and isinstance(beam_stats, dict):
+        portfolio.portfolio_metrics.update(beam_stats)
     
-    logger.info(f"  最终客群组合数: {len(portfolio.segments)}")
+    logger.info(f"  portfolio 预选客群数（filter_similar_rules）: {len(portfolio.segments)}")
     
     # 8. 导出结果
     logger.info("\n[8/8] 导出结果...")
@@ -618,14 +1069,29 @@ def run_stage2_analysis(
     export_atomic_rules(atomic_rules_export, atomic_rules_output, format='csv')
     export_atomic_rules(atomic_rules_export, atomic_rules_output, format='json')
     
-    # 导出候选客群规则（仅含 k>=min_rules_per_segment，不含单规则）
+    # 导出候选客群规则（仅含 k>=min_rules_per_segment，不含单规则；导出为 dedup 后列表）
     candidate_segments_output = output_path / f"candidate_segments_{cohort_name}_{stat_date}"
-    export_candidate_segments(candidate_rules_for_export, candidate_segments_output, column_name_map, format='csv')
-    export_candidate_segments(candidate_rules_for_export, candidate_segments_output, column_name_map, format='json')
+    export_candidate_segments(
+        candidate_rules_for_export, candidate_segments_output, column_name_map,
+        format='csv', total_population=getattr(config, 'total_population', None),
+        cohort_size=getattr(config, 'cohort_size', None), pi_used=pi_used,
+        dedup_before=n_before_dedup, dedup_after=n_after_dedup, dedup_removed=n_before_dedup - n_after_dedup,
+    )
+    export_candidate_segments(
+        candidate_rules_for_export, candidate_segments_output, column_name_map,
+        format='json', total_population=getattr(config, 'total_population', None),
+        cohort_size=getattr(config, 'cohort_size', None), pi_used=pi_used,
+        dedup_before=n_before_dedup, dedup_after=n_after_dedup, dedup_removed=n_before_dedup - n_after_dedup,
+    )
     
-    # 导出推荐客群组合方案
+    # 导出推荐客群组合方案（v2.0: 传入 config 则按档位输出 tiers；metadata 含 pi_used/pi_source）
+    # 两阶段选择始终用全部候选，以保证 recommended 数量与测试 ROC（若改从预选选则 recommended 变少、ROC 下降）
     portfolio_output = output_path / f"segment_portfolio_{cohort_name}_{stat_date}.json"
-    export_segment_portfolio(portfolio, portfolio_output, column_name_map)
+    export_segment_portfolio(
+        portfolio, portfolio_output, column_name_map, config=config,
+        menu_candidates=candidate_rules_for_export if candidate_rules_for_export else None,
+        pi_used=pi_used, pi_source=pi_source
+    )
     
     logger.info("\n" + "=" * 60)
     logger.info("阶段2执行完成！")
