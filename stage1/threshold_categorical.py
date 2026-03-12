@@ -6,10 +6,124 @@
 import pandas as pd
 import numpy as np
 import logging
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+
+def _coverage_for_categories(
+    subset: pd.DataFrame,
+    categories: List[Any],
+    ratio_col: str = 'val_ratio',
+) -> float:
+    """给定类别列表，在 subset（index 含 val_enum）上求覆盖率之和。"""
+    if not categories or subset.empty:
+        return 0.0
+    if 'stat_date' in subset.index.names or 'column_id' in subset.index.names:
+        sub = subset.reset_index(level=[n for n in subset.index.names if n in ('stat_date', 'column_id')], drop=True)
+    else:
+        sub = subset
+    if ratio_col not in sub.columns:
+        return 0.0
+    total = 0.0
+    for v in categories:
+        if v in sub.index:
+            total += float(sub.loc[v, ratio_col])
+    return total
+
+
+def build_candidate_category_family(
+    full_subset: pd.DataFrame,
+    cohort_subset: pd.DataFrame,
+    min_delta: float = 0.01,
+    bad_tokens: Optional[set] = None,
+    max_category_combos: int = 3,
+) -> List[Dict[str, Any]]:
+    """
+    生成候选类别族：单类别、Top2 组合、Top3 组合（至多 max_category_combos 档）；
+    每档含 base_cov, sub_cov, lift, precision（用 full/cohort 统计）。
+    """
+    full_subset_reset = full_subset.reset_index(level=['stat_date', 'column_id'], drop=True) if 'stat_date' in full_subset.index.names else full_subset
+    cohort_subset_reset = cohort_subset.reset_index(level=['stat_date', 'column_id'], drop=True) if 'stat_date' in cohort_subset.index.names else cohort_subset
+    merged = pd.merge(
+        full_subset_reset[['val_ratio']].rename(columns={'val_ratio': 'val_ratio_full'}),
+        cohort_subset_reset[['val_ratio']].rename(columns={'val_ratio': 'val_ratio_base'}),
+        left_index=True, right_index=True, how='outer'
+    )
+    merged['val_ratio_full'] = merged['val_ratio_full'].fillna(0.0)
+    merged['val_ratio_base'] = merged['val_ratio_base'].fillna(0.0)
+    merged['delta'] = merged['val_ratio_base'] - merged['val_ratio_full']
+    cand = merged[merged['delta'] > min_delta].sort_values('delta', ascending=False)
+    if bad_tokens is None:
+        bad_tokens = {"__NULL__", "__OTHER__"}
+    cand = cand[~cand.index.isin(bad_tokens)]
+    if len(cand) == 0:
+        return []
+
+    def base_cov(cats: List[Any]) -> float:
+        return sum(cand.loc[v, 'val_ratio_full'] for v in cats if v in cand.index)
+    def sub_cov(cats: List[Any]) -> float:
+        return sum(cand.loc[v, 'val_ratio_base'] for v in cats if v in cand.index)
+
+    family: List[Dict[str, Any]] = []
+    top_vals = list(cand.index[: max_category_combos])
+    for k in range(1, min(len(top_vals) + 1, max_category_combos + 1)):
+        cats = top_vals[:k]
+        bc = base_cov(cats)
+        sc = sub_cov(cats)
+        if bc <= 0:
+            continue
+        lift = sc / bc
+        precision = sc  # 无 prior 时用 sub_cov 作为 precision 代理
+        family.append({
+            'categories': cats,
+            'base_cov': bc,
+            'sub_cov': sc,
+            'lift': lift,
+            'precision': precision,
+        })
+    return family
+
+
+def _dedupe_category_candidates_by_overlap(
+    candidates: List[Dict[str, Any]],
+    full_subset: pd.DataFrame,
+    overlap_threshold: float,
+) -> List[Dict[str, Any]]:
+    """覆盖率重叠 > overlap_threshold 时只保留 precision 更优的一条。重叠 = 交集在 full 上的覆盖率 / min(base_cov1, base_cov2)。"""
+    if not candidates or overlap_threshold <= 0:
+        return candidates
+    if full_subset.empty:
+        return candidates
+    if 'stat_date' in full_subset.index.names or 'column_id' in full_subset.index.names:
+        full_flat = full_subset.reset_index(level=[n for n in full_subset.index.names if n in ('stat_date', 'column_id')], drop=True)
+    else:
+        full_flat = full_subset
+    if 'val_ratio' not in full_flat.columns:
+        return candidates
+
+    def cov_intersection(cats1: List, cats2: List) -> float:
+        inter = set(cats1) & set(cats2)
+        return sum(float(full_flat.loc[v, 'val_ratio']) for v in inter if v in full_flat.index)
+
+    sorted_c = sorted(candidates, key=lambda x: (-(x.get('precision') or 0), -(x.get('lift') or 0)))
+    keep: List[Dict[str, Any]] = []
+    for c in sorted_c:
+        overlap_any = False
+        bc = c.get('base_cov') or 0
+        for k in keep:
+            bk = k.get('base_cov') or 0
+            denom = min(bc, bk)
+            if denom <= 0:
+                continue
+            inter_cov = cov_intersection(c.get('categories', []), k.get('categories', []))
+            if inter_cov / denom >= overlap_threshold:
+                overlap_any = True
+                break
+        if not overlap_any:
+            keep.append(c)
+    return keep
 
 
 def recommend_categorical_threshold(
@@ -138,7 +252,11 @@ def recommend_categorical_thresholds(
     min_delta: float = 0.01,
     min_cov: float = 0.1,
     min_increment: float = 0.01,
-    bad_tokens: Optional[set] = None
+    bad_tokens: Optional[set] = None,
+    *,
+    output_candidate_family: bool = True,
+    max_category_combos: int = 3,
+    dedup_overlap_threshold: float = 0.8,
 ) -> pd.DataFrame:
     """
     为离散特征推荐类别集合
@@ -166,7 +284,9 @@ def recommend_categorical_thresholds(
         - rule_desc: 规则描述
     """
     logger.info("开始推荐离散特征类别集合...")
-    
+
+    total_candidate_categories = 0
+
     # 获取共同的(stat_date, column_id)组合
     full_keys = set(zip(
         full_categorical_df.index.get_level_values('stat_date'),
@@ -209,16 +329,29 @@ def recommend_categorical_thresholds(
             
             if len(full_subset) == 0 or len(cohort_subset) == 0:
                 continue
-            
-            # 生成推荐
+
+            candidate_category_family: Optional[List[Dict[str, Any]]] = None
+            if output_candidate_family:
+                family_raw = build_candidate_category_family(
+                    full_subset, cohort_subset, min_delta, bad_tokens, max_category_combos
+                )
+                candidate_category_family = _dedupe_category_candidates_by_overlap(
+                    family_raw, full_subset, dedup_overlap_threshold
+                )
+                total_candidate_categories += len(candidate_category_family)
+                logger.debug(
+                    "[stage1] column_id=%s candidate_category_count=%d after_dedup=%d",
+                    column_id, len(family_raw), len(candidate_category_family),
+                )
+
+            # 生成推荐（保留 recommended_categories 兼容）
             recommendation = recommend_categorical_threshold(
                 full_subset, cohort_subset, min_delta, min_cov, min_increment, bad_tokens
             )
-            
+
             if recommendation is None:
-                # 没有找到合适的类别集合
                 column_name = diff_row.get('column_name', column_id)
-                recommendations.append({
+                row_dict = {
                     'column_id': column_id,
                     'rec_categories': None,
                     'cohort_coverage': np.nan,
@@ -228,14 +361,15 @@ def recommend_categorical_thresholds(
                     'cohort_hit_count': np.nan,
                     'rec_category_count': 0,
                     'rule_desc': None
-                })
+                }
+                if candidate_category_family is not None:
+                    row_dict['candidate_category_family'] = candidate_category_family
+                recommendations.append(row_dict)
             else:
-                # 生成规则描述
                 column_name = diff_row.get('column_name', column_id)
                 rec_cats_str = ",".join(map(str, recommendation['rec_categories']))
                 rule_desc = f"{column_name} in {{{rec_cats_str}}}"
-                
-                recommendations.append({
+                row_dict = {
                     'column_id': column_id,
                     'rec_categories': rec_cats_str,
                     'cohort_coverage': recommendation['cohort_coverage'],
@@ -245,7 +379,10 @@ def recommend_categorical_thresholds(
                     'cohort_hit_count': recommendation['cohort_hit_count'],
                     'rec_category_count': recommendation['rec_category_count'],
                     'rule_desc': rule_desc
-                })
+                }
+                if candidate_category_family is not None:
+                    row_dict['candidate_category_family'] = candidate_category_family
+                recommendations.append(row_dict)
                 
         except Exception as e:
             logger.warning(f"处理字段 (stat_date={stat_date}, column_id={column_id}) 时出错: {e}")
@@ -258,8 +395,9 @@ def recommend_categorical_thresholds(
     # 构建结果DataFrame
     result_df = pd.DataFrame(recommendations)
     result_df = result_df.set_index('column_id')
-    
+    if output_candidate_family and total_candidate_categories > 0:
+        logger.info("[stage1] total_candidate_categories=%d", total_candidate_categories)
     logger.info(f"类别集合推荐完成，共 {len(result_df)} 个字段")
-    
+
     return result_df
 

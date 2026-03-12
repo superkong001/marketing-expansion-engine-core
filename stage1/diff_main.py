@@ -4,6 +4,7 @@ CLI入口模块
 提供命令行接口，用于串联配置、加载和差异计算流程，输出结果到CSV文件。
 """
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -53,6 +54,9 @@ NUMERIC_DIFF_HEADER_CN = {
     'rule_desc': '规则描述',
     'rule_reason': '推荐理由',
     'has_recommendation': '是否给出阈值推荐',
+    # v2.0: full quantiles for Stage2 per-rule coverage
+    'p10_full': 'p10_full', 'p25_full': 'p25_full', 'p50_full': 'p50_full',
+    'p75_full': 'p75_full', 'p90_full': 'p90_full', 'p95_full': 'p95_full',
 }
 CATEGORICAL_DIFF_HEADER_CN = {
     'column_id': '字段ID',
@@ -369,12 +373,18 @@ def run_diff_analysis(
         min_cov = stage1_config.numeric_threshold.min_cohort_coverage if stage1_config else 0.1
         min_lift = stage1_config.numeric_threshold.min_lift if stage1_config else 1.2
         max_base_cov = getattr(stage1_config.numeric_threshold, 'max_base_cov_for_numeric', 0.15) if stage1_config else 0.15
+        nt = stage1_config.numeric_threshold if stage1_config else None
         numeric_thresholds_df = recommend_numeric_thresholds(
             numeric_diff_for_threshold, full_numeric_df, cohort_numeric_df,
             min_cohort_coverage=min_cov,
             min_lift=min_lift,
             target_ratio=target_ratio,
             max_base_cov_for_numeric=max_base_cov,
+            output_candidate_family=getattr(nt, 'output_candidate_family', True) if nt else True,
+            upper_quantiles=getattr(nt, 'upper_quantiles', None) if nt else None,
+            lower_quantiles=getattr(nt, 'lower_quantiles', None) if nt else None,
+            dedup_overlap_threshold=getattr(nt, 'dedup_overlap_threshold', 0.8) if nt else 0.8,
+            prior_pi=getattr(nt, 'prior_pi', None) if nt else None,
         )
         
         # 合并推荐结果到差异结果
@@ -493,11 +503,15 @@ def run_diff_analysis(
             min_delta = stage1_config.categorical_threshold.min_delta if stage1_config else 0.01
             min_cov_cat = stage1_config.categorical_threshold.min_cov if stage1_config else 0.1
             min_inc = stage1_config.categorical_threshold.min_increment if stage1_config else 0.01
+            ct = stage1_config.categorical_threshold if stage1_config else None
             categorical_thresholds_df = recommend_categorical_thresholds(
                 categorical_diff_for_threshold, full_categorical_df, cohort_categorical_df,
                 min_delta=min_delta,
                 min_cov=min_cov_cat,
                 min_increment=min_inc,
+                output_candidate_family=getattr(ct, 'output_candidate_family', True) if ct else True,
+                max_category_combos=getattr(ct, 'max_category_combos', 3) if ct else 3,
+                dedup_overlap_threshold=getattr(ct, 'dedup_overlap_threshold', 0.8) if ct else 0.8,
             )
             
             # 合并推荐结果到差异结果
@@ -544,11 +558,46 @@ def run_diff_analysis(
     try:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        
+
+        # 从 full_stats 的 total_count 汇总全量用户数（多个不同值取最高），供 Stage2 估计用户数使用
+        total_population_full = None
+        counts = []
+        if 'total_count' in full_numeric_df.columns:
+            counts.extend(pd.to_numeric(full_numeric_df['total_count'], errors='coerce').dropna().astype(int).tolist())
+        if 'total_count' in full_categorical_df.columns:
+            counts.extend(pd.to_numeric(full_categorical_df['total_count'], errors='coerce').dropna().astype(int).tolist())
+        if counts:
+            total_population_full = int(max(counts))
+            logger.info(f"  全量用户数（来自 full_stats total_count，取最高）: {total_population_full}")
+        # 圈定客群总数，供 Stage2 计算 pi = N_sub/N_full（不默认）
+        total_population_cohort = None
+        cohort_counts = []
+        if 'total_count' in cohort_numeric_df.columns:
+            cohort_counts.extend(pd.to_numeric(cohort_numeric_df['total_count'], errors='coerce').dropna().astype(int).tolist())
+        if 'total_count' in cohort_categorical_df.columns:
+            cohort_counts.extend(pd.to_numeric(cohort_categorical_df['total_count'], errors='coerce').dropna().astype(int).tolist())
+        if cohort_counts:
+            total_population_cohort = int(max(cohort_counts))
+            logger.info(f"  圈定客群数（来自 cohort_stats total_count，取最高）: {total_population_cohort}")
+        meta = {
+            "stat_date": stat_date,
+            "cohort_name": cohort_name,
+            "total_population_full": total_population_full,
+            "total_population_cohort": total_population_cohort,
+        }
+        meta_file = output_path / f"stage1_meta_{cohort_name}_{stat_date}.json"
+        with open(meta_file, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        logger.info(f"  阶段1元数据已保存: {meta_file}")
+
         # 保存连续特征差异结果（先写临时文件，再替换，避免目标被占用时丢失结果）
         numeric_output_file = output_path / f"numeric_diff_{cohort_name}_{stat_date}.csv"
         numeric_tmp_file = output_path / f"numeric_diff_{cohort_name}_{stat_date}.csv.tmp"
         numeric_export = numeric_diff_df.copy()
+        if 'candidate_threshold_family' in numeric_export.columns:
+            numeric_export['candidate_threshold_family'] = numeric_export['candidate_threshold_family'].apply(
+                lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (list, dict)) else x
+            )
         numeric_export.columns = [NUMERIC_DIFF_HEADER_CN.get(c, c) for c in numeric_export.columns]
         numeric_export.index.name = NUMERIC_DIFF_HEADER_CN.get(numeric_export.index.name, numeric_export.index.name or '字段ID')
         numeric_export.to_csv(numeric_tmp_file, encoding='utf-8-sig', index=True)
@@ -566,6 +615,10 @@ def run_diff_analysis(
         categorical_output_file = output_path / f"categorical_diff_{cohort_name}_{stat_date}.csv"
         categorical_tmp_file = output_path / f"categorical_diff_{cohort_name}_{stat_date}.csv.tmp"
         categorical_export = categorical_diff_df.copy()
+        if 'candidate_category_family' in categorical_export.columns:
+            categorical_export['candidate_category_family'] = categorical_export['candidate_category_family'].apply(
+                lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (list, dict)) else x
+            )
         categorical_export.columns = [CATEGORICAL_DIFF_HEADER_CN.get(c, c) for c in categorical_export.columns]
         categorical_export.index.name = CATEGORICAL_DIFF_HEADER_CN.get(categorical_export.index.name, categorical_export.index.name or '字段ID')
         if len(categorical_diff_df) > 0:

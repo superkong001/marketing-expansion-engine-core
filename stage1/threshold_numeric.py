@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import logging
 from scipy.stats import norm
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 try:
     from .analyze_distributions import detect_distribution_type_from_stats
@@ -26,7 +26,9 @@ def estimate_coverage_from_quantiles(
     high: float
 ) -> float:
     """
-    基于分位数映射估算覆盖率（线性插值）
+    基于分位数映射估算覆盖率（线性插值 + 区间外外推）。
+    单侧区间（如 x < 上界）若上界落在分位数范围左侧时，原逻辑会得到 0；
+    现对区间外做线性外推，使组合覆盖率（各规则乘积）可算、与方案文档一致。
     
     Args:
         quantile_map: 分位数映射，格式 {quantile_value: quantile_prob}
@@ -39,37 +41,42 @@ def estimate_coverage_from_quantiles(
     """
     if not quantile_map or len(quantile_map) < 2:
         return 0.0
-    
-    # 将分位数映射转换为排序列表
+
     sorted_quantiles = sorted(quantile_map.items())
     quantile_values = [q[0] for q in sorted_quantiles]
     quantile_probs = [q[1] for q in sorted_quantiles]
-    
+    q0, p0 = quantile_values[0], quantile_probs[0]
+    q_last, p_last = quantile_values[-1], quantile_probs[-1]
+    span = q_last - q0
+
     def interpolate_F(x: float) -> float:
-        """线性插值得到 F(x)"""
-        if x <= quantile_values[0]:
-            return quantile_probs[0]
-        if x >= quantile_values[-1]:
-            return quantile_probs[-1]
-        
-        # 找到 x 所在区间
-        for i in range(len(quantile_values) - 1):
-            if quantile_values[i] <= x <= quantile_values[i + 1]:
-                # 线性插值
-                x1, p1 = quantile_values[i], quantile_probs[i]
-                x2, p2 = quantile_values[i + 1], quantile_probs[i + 1]
-                if x2 == x1:
-                    return p1
-                ratio = (x - x1) / (x2 - x1)
-                return p1 + ratio * (p2 - p1)
-        
-        return 0.0
-    
-    # 计算覆盖率
+        """线性插值得到 F(x)；区间外做线性外推，使单侧区间得到非零估计。"""
+        if q0 <= x <= q_last:
+            for i in range(len(quantile_values) - 1):
+                if quantile_values[i] <= x <= quantile_values[i + 1]:
+                    x1, p1 = quantile_values[i], quantile_probs[i]
+                    x2, p2 = quantile_values[i + 1], quantile_probs[i + 1]
+                    if x2 == x1:
+                        return p1
+                    ratio = (x - x1) / (x2 - x1)
+                    return p1 + ratio * (p2 - p1)
+            return p_last
+        if x < q0:
+            if span <= 0:
+                return 0.0
+            # 从 (q0 - span, 0) 到 (q0, p0) 线性外推，F(x) in [0, p0]
+            t = (x - (q0 - span)) / span
+            return max(0.0, min(p0, p0 * t))
+        if x > q_last:
+            if span <= 0:
+                return 1.0
+            t = (x - q_last) / span
+            return min(1.0, p_last + (1.0 - p_last) * min(1.0, t))
+        return p_last
+
     F_low = interpolate_F(low)
     F_high = interpolate_F(high)
     coverage = F_high - F_low
-    
     return max(0.0, min(1.0, coverage))
 
 
@@ -648,6 +655,131 @@ def _value_at_quantile(quantile_map: Dict[float, float], p: float) -> Optional[f
     return None
 
 
+def _build_quantile_map_from_row(row: pd.Series) -> Dict[float, float]:
+    """从统计行构建 value -> prob 分位映射，供 estimate_coverage_from_quantiles / _value_at_quantile 使用。"""
+    q_map: Dict[float, float] = {}
+    for key, prob in [
+        ('p05_cont', 0.05), ('p05', 0.05), ('p01_cont', 0.01), ('p01', 0.01),
+        ('q3_cont', 0.25), ('q1', 0.25), ('q6_cont', 0.5), ('median', 0.5),
+        ('q9_cont', 0.75), ('q3', 0.75),
+        ('p90_cont', 0.9), ('p90', 0.9), ('p95_cont', 0.95), ('p95', 0.95), ('p99_cont', 0.99), ('p99', 0.99),
+    ]:
+        if key not in row.index:
+            continue
+        v = _to_scalar(row.get(key), np.nan)
+        if pd.notna(v):
+            q_map[float(v)] = prob
+    return q_map
+
+
+def _precision_est_from_coverage(sub_cov: float, base_cov: float, prior_pi: Optional[float]) -> float:
+    """贝叶斯估计 P(圈定|命中): 若 prior_pi 存在则 sub_cov*pi/(sub_cov*pi+base_cov*(1-pi))，否则用 sub_cov 作为代理。"""
+    if prior_pi is not None and 0 < prior_pi < 1 and base_cov > 0:
+        denom = sub_cov * prior_pi + base_cov * (1 - prior_pi)
+        return (sub_cov * prior_pi / denom) if denom > 0 else float(sub_cov)
+    return float(sub_cov)
+
+
+def build_candidate_threshold_family(
+    full_row: pd.Series,
+    cohort_row: pd.Series,
+    upper_quantiles: List[float],
+    lower_quantiles: List[float],
+    prior_pi: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """
+    按分位为连续字段生成候选阈值族：上尾 P70/P80/...、下尾 P30/P20/...；
+    每条候选含 quantile_tag, low, high, base_cov_est, sub_cov_est, lift_est, precision_est, support_est。
+    """
+    qm_full = _build_quantile_map_from_row(full_row)
+    qm_cohort = _build_quantile_map_from_row(cohort_row)
+    if len(qm_full) < 2 or len(qm_cohort) < 2:
+        return []
+    big = 1e30
+    small = -1e30
+    total_count = _to_scalar(full_row.get('total_count'), _to_scalar(full_row.get('n'), None))
+    support_est = float(total_count) if total_count is not None and not pd.isna(total_count) else None  # type: ignore[assignment]
+
+    candidates: List[Dict[str, Any]] = []
+    for q in upper_quantiles:
+        thr = _value_at_quantile(qm_full, q)
+        if thr is None:
+            continue
+        low, high = thr, big
+        base_cov = estimate_coverage_from_quantiles(qm_full, low, high)
+        sub_cov = estimate_coverage_from_quantiles(qm_cohort, low, high)
+        if base_cov <= 0:
+            continue
+        lift_est = sub_cov / base_cov
+        precision_est = _precision_est_from_coverage(sub_cov, base_cov, prior_pi)
+        candidates.append({
+            'quantile_tag': f'P{int(round(q * 100))}',
+            'low': low,
+            'high': high,
+            'base_cov_est': base_cov,
+            'sub_cov_est': sub_cov,
+            'lift_est': lift_est,
+            'precision_est': precision_est,
+            'support_est': support_est,
+            'direction': 'high',
+        })
+    for q in lower_quantiles:
+        thr = _value_at_quantile(qm_full, q)
+        if thr is None:
+            continue
+        low, high = small, thr
+        base_cov = estimate_coverage_from_quantiles(qm_full, low, high)
+        sub_cov = estimate_coverage_from_quantiles(qm_cohort, low, high)
+        if base_cov <= 0:
+            continue
+        lift_est = sub_cov / base_cov
+        precision_est = _precision_est_from_coverage(sub_cov, base_cov, prior_pi)
+        candidates.append({
+            'quantile_tag': f'P{int(round(q * 100))}',
+            'low': low,
+            'high': high,
+            'base_cov_est': base_cov,
+            'sub_cov_est': sub_cov,
+            'lift_est': lift_est,
+            'precision_est': precision_est,
+            'support_est': support_est,
+            'direction': 'low',
+        })
+    return candidates
+
+
+def _dedupe_candidates_by_overlap(
+    candidates: List[Dict[str, Any]],
+    qm_full: Dict[float, float],
+    overlap_threshold: float,
+) -> List[Dict[str, Any]]:
+    """覆盖率重叠 > overlap_threshold 时只保留 precision_est 更优的一条。"""
+    if not candidates or overlap_threshold <= 0:
+        return candidates
+    # 按 precision_est 降序，优先保留更优
+    sorted_c = sorted(candidates, key=lambda x: (-(x.get('precision_est') or 0), -(x.get('lift_est') or 0)))
+    keep: List[Dict[str, Any]] = []
+    for c in sorted_c:
+        overlap_any = False
+        for k in keep:
+            inter_low = max(c['low'], k['low'])
+            inter_high = min(c['high'], k['high'])
+            if inter_low >= inter_high:
+                continue
+            cov_inter = estimate_coverage_from_quantiles(qm_full, inter_low, inter_high)
+            cov_c = c.get('base_cov_est') or 0
+            cov_k = k.get('base_cov_est') or 0
+            denom = min(cov_c, cov_k)
+            if denom <= 0:
+                continue
+            if cov_inter / denom >= overlap_threshold:
+                overlap_any = True
+                break
+        if not overlap_any:
+            keep.append(c)
+    return keep
+
+
 def _recommend_symmetric_tail(
     full_row: pd.Series,
     cohort_row: pd.Series,
@@ -897,6 +1029,12 @@ def recommend_numeric_thresholds(
     min_lift: float = 1.2,
     target_ratio: Optional[float] = None,
     max_base_cov_for_numeric: Optional[float] = None,
+    *,
+    output_candidate_family: bool = True,
+    upper_quantiles: Optional[List[float]] = None,
+    lower_quantiles: Optional[List[float]] = None,
+    dedup_overlap_threshold: float = 0.8,
+    prior_pi: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     为连续特征推荐最优阈值区间（按分布类型固定策略，不依赖 coverage/lift 决策）。
@@ -918,16 +1056,21 @@ def recommend_numeric_thresholds(
         cohort_coverage_est, full_coverage_est, lift_est（debug）, rule_desc, rule_reason, has_recommendation
     """
     logger.info("开始推荐连续特征阈值区间...")
-    
+    if upper_quantiles is None:
+        upper_quantiles = [0.7, 0.8, 0.9, 0.95]
+    if lower_quantiles is None:
+        lower_quantiles = [0.3, 0.2, 0.1, 0.05]
+
     # 配置字典
     config = {
         'min_cohort_coverage': min_cohort_coverage,
         'min_lift': min_lift,
         'target_ratio': target_ratio
     }
-    
+
     # 存储推荐结果
     recommendations = []
+    total_candidate_thresholds = 0
     
     # 遍历每个字段
     for column_id in numeric_diff_df.index:
@@ -991,13 +1134,43 @@ def recommend_numeric_thresholds(
                 'p10_cohort': p10_c, 'p25_cohort': P25_c, 'p50_cohort': p50_c, 'p75_cohort': P75_c, 'p90_cohort': p90_c, 'p95_cohort': p95_c,
             }
             max_cov = max_base_cov_for_numeric if max_base_cov_for_numeric is not None else 0.15
-            # 按分布类型固定策略推荐；coverage/lift 仅作 debug 输出，不参与决策
-            rec = _recommend_fixed_strategy(full_row, cohort_row, diff_row, distribution_type, max_base_cov_for_numeric=max_cov)
-            
+            candidate_threshold_family: Optional[List[Dict[str, Any]]] = None
+            rec = None
+
+            if output_candidate_family:
+                family_raw = build_candidate_threshold_family(
+                    full_row, cohort_row, upper_quantiles, lower_quantiles, prior_pi
+                )
+                qm_full = _build_quantile_map_from_row(full_row)
+                candidate_threshold_family = _dedupe_candidates_by_overlap(
+                    family_raw, qm_full, dedup_overlap_threshold
+                )
+                total_candidate_thresholds += len(candidate_threshold_family)
+                logger.debug(
+                    "[stage1] column_id=%s candidate_threshold_count=%d after_dedup=%d",
+                    column_id, len(family_raw), len(candidate_threshold_family),
+                )
+                if candidate_threshold_family:
+                    best = max(candidate_threshold_family, key=lambda x: (x.get('precision_est') or 0, x.get('lift_est') or 0))
+                    rec = {
+                        'rec_low': best['low'],
+                        'rec_high': best['high'],
+                        'direction': best.get('direction', 'high'),
+                        'cohort_coverage_est': best['sub_cov_est'],
+                        'full_coverage_est': best['base_cov_est'],
+                        'lift_est': best['lift_est'],
+                        'rule_desc': None,
+                        'rule_reason': f"from_candidate_family_{best.get('quantile_tag', '')}",
+                        'has_recommendation': True,
+                    }
+            if rec is None:
+                # 按分布类型固定策略推荐；coverage/lift 仅作 debug 输出，不参与决策
+                rec = _recommend_fixed_strategy(full_row, cohort_row, diff_row, distribution_type, max_base_cov_for_numeric=max_cov)
+
             # 生成推荐结果（再次 sanitize 禁止 Infinity 输出）
             if rec is not None:
                 rl, rh, rd = _sanitize_no_inf(rec['rec_low'], rec['rec_high'], rec.get('rule_desc'))
-                recommendations.append({
+                row_dict: Dict[str, Any] = {
                     'column_id': column_id,
                     'rec_low': rl,
                     'rec_high': rh,
@@ -1009,7 +1182,10 @@ def recommend_numeric_thresholds(
                     'rule_reason': rec.get('rule_reason', ''),
                     'has_recommendation': rec['has_recommendation'],
                     **quantile_cols,
-                })
+                }
+                if candidate_threshold_family is not None:
+                    row_dict['candidate_threshold_family'] = candidate_threshold_family
+                recommendations.append(row_dict)
             else:
                 # 没有推荐
                 column_name = diff_row.get('column_name', column_id)
@@ -1017,7 +1193,7 @@ def recommend_numeric_thresholds(
                 effect_size = float(diff_row.get('effect_size', 0))
                 direction = "high" if effect_size >= 0 else "low"
                 
-                recommendations.append({
+                no_rec_dict: Dict[str, Any] = {
                     'column_id': column_id,
                     'rec_low': np.nan,
                     'rec_high': np.nan,
@@ -1029,7 +1205,10 @@ def recommend_numeric_thresholds(
                     'rule_reason': f"{distribution_type}: no suitable threshold found",
                     'has_recommendation': False,
                     **quantile_cols,
-                })
+                }
+                if output_candidate_family and candidate_threshold_family is not None:
+                    no_rec_dict['candidate_threshold_family'] = candidate_threshold_family
+                recommendations.append(no_rec_dict)
                 
         except Exception as e:
             logger.warning(f"处理字段 {column_id} 时出错: {e}")
@@ -1048,6 +1227,11 @@ def recommend_numeric_thresholds(
             result_df[col] = result_df[col].replace([np.inf, -np.inf], np.nan)
     if 'rule_desc' in result_df.columns:
         result_df['rule_desc'] = result_df['rule_desc'].astype(str).str.replace('Infinity', '', regex=False).str.replace('inf', '', regex=False).str.strip()
+    if output_candidate_family and total_candidate_thresholds > 0:
+        logger.info(
+            "[stage1] total_candidate_thresholds=%d",
+            total_candidate_thresholds,
+        )
     logger.info(f"阈值推荐完成，共 {len(result_df)} 个字段")
     return result_df
 
