@@ -6,7 +6,7 @@
 """
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import json
 import logging
 
@@ -30,6 +30,11 @@ class Stage1NumericThresholdConfig:
     min_cohort_coverage: float = 0.1
     min_lift: float = 1.2
     max_base_cov_for_numeric: float = 0.15  # symmetric 尾部阈值满足的全量覆盖率上限，供 Stage2 多阈值
+    output_candidate_family: bool = True
+    upper_quantiles: List[float] = field(default_factory=lambda: [0.7, 0.8, 0.9, 0.95])
+    lower_quantiles: List[float] = field(default_factory=lambda: [0.3, 0.2, 0.1, 0.05])
+    dedup_overlap_threshold: float = 0.8
+    prior_pi: Optional[float] = None
 
 
 @dataclass
@@ -38,6 +43,9 @@ class Stage1CategoricalThresholdConfig:
     min_delta: float = 0.01
     min_cov: float = 0.1
     min_increment: float = 0.01
+    output_candidate_family: bool = True
+    max_category_combos: int = 3
+    dedup_overlap_threshold: float = 0.8
 
 
 @dataclass
@@ -97,11 +105,19 @@ class Stage1Config:
                 min_cohort_coverage=float(num_thr.get("min_cohort_coverage", 0.1)),
                 min_lift=float(num_thr.get("min_lift", 1.2)),
                 max_base_cov_for_numeric=float(num_thr.get("max_base_cov_for_numeric", 0.15)),
+                output_candidate_family=bool(num_thr.get("output_candidate_family", True)),
+                upper_quantiles=[float(x) for x in num_thr.get("upper_quantiles", [0.7, 0.8, 0.9, 0.95])],
+                lower_quantiles=[float(x) for x in num_thr.get("lower_quantiles", [0.3, 0.2, 0.1, 0.05])],
+                dedup_overlap_threshold=float(num_thr.get("dedup_overlap_threshold", 0.8)),
+                prior_pi=float(num_thr["prior_pi"]) if num_thr.get("prior_pi") is not None else None,
             ),
             categorical_threshold=Stage1CategoricalThresholdConfig(
                 min_delta=float(cat_thr.get("min_delta", 0.01)),
                 min_cov=float(cat_thr.get("min_cov", 0.1)),
                 min_increment=float(cat_thr.get("min_increment", 0.01)),
+                output_candidate_family=bool(cat_thr.get("output_candidate_family", True)),
+                max_category_combos=int(cat_thr.get("max_category_combos", 3)),
+                dedup_overlap_threshold=float(cat_thr.get("dedup_overlap_threshold", 0.8)),
             ),
             diff_numeric=Stage1DiffNumericConfig(
                 effect_size_significant_threshold=float(diff_num.get("effect_size_significant_threshold", 0.2)),
